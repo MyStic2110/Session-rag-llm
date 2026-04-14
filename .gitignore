@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.pdf
+tmp/
+.vscode/
+.idea/
+.DS_Store
