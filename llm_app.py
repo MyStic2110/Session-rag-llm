@@ -47,31 +47,41 @@ def get_mistral_client() -> Mistral:
 AGENT_ALIAS_MAP = {
     "google/gemma-4-31b-it:free": "Primary Neural Specialist",
     "google/gemma-4-26b-a4b-it:free": "Cognitive Logic Node",
+    "meta-llama/llama-3.1-70b-instruct:free": "Advanced Reasoning Architect",
     "meta-llama/llama-3.1-8b-instruct:free": "Factual Cross-Reference Specialist",
     "google/gemma-3-27b-it:free": "Secondary Contextual Analyst",
+    "mistralai/mistral-7b-instruct:free": "Drafting Specialist Node",
+    "qwen/qwen-2-72b-instruct:free": "Complex Pattern Interpreter",
+    "mistral-small-latest": "Mistral High-Speed Logic Node",
     "default": "Backup Specialist Node"
 }
 
+# Global Fallback Chain
+FALLBACK_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "meta-llama/llama-3.1-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2-72b-instruct:free"
+]
+
 async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False, on_retry: Optional[callable] = None):
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    # We no longer strictly rely on .env for the primary model to ensure resilience
-    primary_model = os.environ.get("ANALYSIS_MODEL", "google/gemma-4-31b-it:free")
+    primary_model = os.environ.get("ANALYSIS_MODEL", FALLBACK_MODELS[0])
     
-    MODELS_CHAIN = [
-        primary_model,
-        "google/gemma-4-31b-it:free",
-        "google/gemma-4-26b-a4b-it:free",
-        "meta-llama/llama-3.1-8b-instruct:free",
-        "google/gemma-3-27b-it:free"
-    ]
-    MODELS_CHAIN = list(dict.fromkeys(MODELS_CHAIN))
+    # Construct chain starting with preferred model
+    MODELS_CHAIN = list(dict.fromkeys([primary_model] + FALLBACK_MODELS))
 
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://lumehealth.ai", # Required by OpenRouter for free models
+        "X-Title": "LumeHealth Intelligence"
     }
     
     last_error = ""
@@ -122,7 +132,37 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False, 
             continue
             
     # If all fail
-    raise HTTPException(status_code=503, detail=f"All OpenRouter models in fallback chain failed. Last Error: {last_error}")
+    raise HTTPException(status_code=503, detail=f"All OpenRouter models failed. Logs: {last_error}")
+
+async def call_mistral_direct(messages: List[Dict[str, Any]]):
+    """Fallback to Mistral Direct API if OpenRouter fails."""
+    try:
+        print(f"[*] [LLM Service] Critical Fallback: Attempting Mistral Direct API...")
+        client = get_mistral_client()
+        # Using mistral-small-latest for optimal speed/reasoning balance
+        response = client.chat.complete(
+            model="mistral-small-latest",
+            messages=messages,
+            response_format={"type": "json_object"}
+        )
+        
+        # Format response to match OpenRouter's structure for consistency
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": response.choices[0].message.content
+                }
+            }],
+            "usage": {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
+        }
+    except Exception as e:
+        print(f"[!] [LLM Service] Mistral Direct Error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Mistral Fallback failed: {str(e)}")
 
 def clean_json_response(content: str) -> str:
     """Strips reasoning/thought tags from content to extract pure JSON."""
@@ -479,11 +519,22 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             import asyncio
             # Notify UI of Agent Selection
             async def on_retry_l2(alias: str):
-                yield f"event: retry\ndata: {json.dumps({'agent_alias': alias})}\n\n"
+                return f"event: retry\ndata: {json.dumps({'agent_alias': alias})}\n\n"
 
             # Layer 2: Extraction using OpenRouter with Reasoning
             messages_l2 = [{"role": "user", "content": extraction_prompt}]
-            extract_res = await call_openrouter(messages_l2, on_retry=on_retry_l2)
+            
+            extract_res = None
+            try:
+                # One call handles the entire Fallback Chain
+                extract_res = await call_openrouter(messages_l2, stream=False)
+            except Exception as e:
+                print(f"[!] OpenRouter Chain Exhausted (L2). engaging Mistral Fallback...")
+                yield f"event: retry\ndata: {json.dumps({'agent_alias': 'Mistral High-Speed Logic Node'})}\n\n"
+                extract_res = await call_mistral_direct(messages_l2)
+            
+            if not extract_res:
+                raise HTTPException(status_code=503, detail="Analytical Layer 2 failed entirely.")
             
             message_l2 = extract_res['choices'][0]['message']
             content_l2 = clean_json_response(message_l2.get('content', '{}'))
@@ -587,9 +638,19 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             ]
             
             async def on_retry_l3(alias: str):
-                yield f"event: retry\ndata: {json.dumps({'agent_alias': alias})}\n\n"
+                return f"event: retry\ndata: {json.dumps({'agent_alias': alias})}\n\n"
 
-            final_res = await call_openrouter(messages_l3, on_retry=on_retry_l3)
+            final_res = None
+            try:
+                # One call handles the entire Fallback Chain
+                final_res = await call_openrouter(messages_l3, stream=False)
+            except Exception as e:
+                print(f"[!] OpenRouter Chain Exhausted (L3). engaging Mistral Fallback...")
+                yield f"event: retry\ndata: {json.dumps({'agent_alias': 'Mistral High-Speed Logic Node'})}\n\n"
+                final_res = await call_mistral_direct(messages_l3)
+
+            if not final_res:
+                raise HTTPException(status_code=503, detail="Analytical Layer 3 failed entirely.")
             content_l3 = clean_json_response(final_res['choices'][0]['message'].get('content', '{}'))
             analysis_data = json.loads(content_l3)
             analysis_data["status"] = "success"
