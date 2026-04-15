@@ -65,6 +65,7 @@ class FutureMapping(BaseModel):
     coverage_status: str
     coverage_gap_risk: str
     severity_trend: str
+    source_proof: str
 
 class ComprehensiveAnalysisResponse(BaseModel):
     summary: str
@@ -109,8 +110,8 @@ async def process_ocr(doc_type: str = Form(...), file: UploadFile = File(...)):
     raw_content = await file.read()
     content_bytes = cast(bytes, raw_content)
     
-    if len(content_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB.")
+    if len(content_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 5MB.")
     
     tmp_path = ""
     try:
@@ -260,6 +261,7 @@ async def analyze_coverage(payload: AnalyzePayload):
                 "pattern": "Health Trend", 
                 "future_condition": "Likely Diagnosis", 
                 "coverage_status": "Covered|Excluded|Partial", 
+                "source_proof": "Policy Section X / Evidence text",
                 "coverage_gap_risk": "High|Medium|Low", 
                 "severity_trend": "Increasing|Stable|Decreasing" 
             }}],
@@ -393,6 +395,7 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                     "pattern": "Health Trend", 
                     "future_condition": "Likely Diagnosis", 
                     "coverage_status": "Covered|Excluded|Partial", 
+                    "source_proof": "Policy Section X / Evidence text",
                     "coverage_gap_risk": "High|Medium|Low", 
                     "severity_trend": "Increasing|Stable|Decreasing" 
                 }}],
