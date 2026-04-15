@@ -14,6 +14,7 @@ from mistralai.client import Mistral
 from io import StringIO
 import sys
 import contextlib
+import httpx
 
 load_dotenv(override=True)
 
@@ -27,12 +28,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "online",
+        "service": "LumeHealth LLM Microservice",
+        "model": os.environ.get("ANALYSIS_MODEL", "google/gemma-4-26b-a4b-it:free"),
+        "ocr_engine": "Mistral OCR 2512"
+    }
+
 def get_mistral_client() -> Mistral:
-    key = os.environ.get("MISTRAL_API_KEY")
-    if not key:
-        print("[!] ERROR: Mistral API key not configured")
-        raise HTTPException(status_code=500, detail="Mistral API key not configured")
-    return Mistral(api_key=key)
+    api_key = os.environ.get("MISTRAL_API_KEY")
+    if not api_key:
+        raise ValueError("MISTRAL_API_KEY is not set")
+    return Mistral(api_key=api_key)
+
+async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    model = os.environ.get("ANALYSIS_MODEL", "google/gemma-4-26b-a4b-it:free")
+    
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": model,
+        "messages": messages,
+        "reasoning": {"enabled": True},
+        "response_format": {"type": "json_object"}
+    }
+    
+    if stream:
+        return httpx.AsyncClient().stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+    else:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+            if resp.status_code != 200:
+                print(f"[!] OpenRouter Error: {resp.text}")
+                raise HTTPException(status_code=resp.status_code, detail=f"OpenRouter Error: {resp.text}")
+            return resp.json()
 
 class AnalyzePayload(BaseModel):
     health_text: str
@@ -52,12 +90,20 @@ class RiskOutlook(BaseModel):
     medium_term_multiplier: str
     long_term_multiplier: str
 
+class ContextualGuardrail(BaseModel):
+    category: str
+    limit_details: str
+    waiting_period: str
+    red_lining_risk: str
+    source_citation: str
+
 class InsuranceInfo(BaseModel):
     covered: List[str]
     conditional: List[str]
     not_covered: List[str]
     future_cost_awareness: str
     potential_out_of_pocket_increase: str
+    contextual_guardrails: List[ContextualGuardrail] = []
 
 class FutureMapping(BaseModel):
     pattern: str
@@ -66,6 +112,8 @@ class FutureMapping(BaseModel):
     coverage_gap_risk: str
     severity_trend: str
     source_proof: str
+    red_line_risk: str
+    intent_clarity_explanation: str
 
 class ComprehensiveAnalysisResponse(BaseModel):
     summary: str
@@ -118,7 +166,6 @@ async def process_ocr(doc_type: str = Form(...), file: UploadFile = File(...)):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(content_bytes)
             tmp_path = tmp.name
-
         return await run_mistral_ocr_process(tmp_path, file.filename)
             
     except Exception as e:
@@ -191,21 +238,32 @@ async def analyze_coverage(payload: AnalyzePayload):
             "insurance": {{
                 "matched_policy_items": ["string: benefit name"],
                 "coverage_details": {{ "covered": ["string"], "conditional": ["string"], "excluded": ["string"] }},
-                "waiting_periods": ["string: period description"]
+                "waiting_periods": ["string: period description"],
+                "contextual_guardrails": [
+                    {{
+                        "category": "Maternity|Oncology|Cardiology|Other",
+                        "limit_details": "string: sub-limits, caps, co-pays",
+                        "waiting_period": "string",
+                        "red_lining_risk": "High|Moderate|Low",
+                        "source_citation": "string: precise policy section"
+                    }}
+                ]
             }}
         }}
         STRICT RULES: 
-        1. NO conversational text. 
-        2. NO markdown formatting outside the JSON block.
-        3. All numeric scores must be INTEGERS.
-        4. Do NOT hallucinate data not present in texts.
+        1. Contextual Guardrails: ONLY populate if the Health Report indicates a relevant condition (e.g. identify 'Maternity' details ONLY if pregnancy is mentioned).
+        2. NO conversational text. 
+        3. NO markdown formatting outside the JSON block.
+        4. All numeric scores must be INTEGERS.
+        5. Do NOT hallucinate data not present in texts.
         """
-        extract_res = client.chat.complete(
-            model="mistral-large-latest",
-            messages=[{"role": "user", "content": extraction_prompt}],
-            response_format={"type": "json_object"}
-        )
-        deterministic_data = json.loads(extract_res.choices[0].message.content)
+        # Layer 2: Extraction using OpenRouter with Reasoning
+        messages_layer2 = [{"role": "user", "content": extraction_prompt}]
+        extract_res = await call_openrouter(messages_layer2)
+        
+        message_l2 = extract_res['choices'][0]['message']
+        deterministic_data = json.loads(message_l2.get('content', '{}'))
+        reasoning_l2 = message_l2.get('reasoning_details')
 
         system_prompt = """
         You are a health and insurance explanation assistant.
@@ -255,26 +313,48 @@ async def analyze_coverage(payload: AnalyzePayload):
                 "conditional": ["Condition X", "Condition Y"], 
                 "not_covered": ["Exclusion Z"], 
                 "future_cost_awareness": "Detailed impact on future premiums/costs", 
-                "potential_out_of_pocket_increase": "Percentage string" 
+                "potential_out_of_pocket_increase": "Percentage string",
+                "contextual_guardrails": [{{
+                    "category": "Type",
+                    "limit_details": "Full explanation of sub-limits/caps",
+                    "waiting_period": "X months/years",
+                    "red_lining_risk": "High|Moderate|Low",
+                    "source_citation": "Policy Ref"
+                }}]
             }},
             "future_coverage_mapping": [{{ 
                 "pattern": "Health Trend", 
                 "future_condition": "Likely Diagnosis", 
                 "coverage_status": "Covered|Excluded|Partial", 
                 "source_proof": "Policy Section X / Evidence text",
+                "red_line_risk": "High|Moderate|Low",
+                "intent_clarity_explanation": "How precisely the policy covers this intent",
                 "coverage_gap_risk": "High|Medium|Low", 
                 "severity_trend": "Increasing|Stable|Decreasing" 
             }}],
             "disclaimer": "Safety statement"
         }}
         """
-        final_res = client.chat.complete(
-            model="mistral-large-latest",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": final_prompt}],
-            response_format={"type": "json_object"}
-        )
-        analysis_data = json.loads(final_res.choices[0].message.content)
-        print("[OK] [LLM Service] ANALYSIS COMPLETE.")
+        # Layer 3: Explanation using OpenRouter with Reasoning Pass-back
+        messages_layer3 = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": extraction_prompt},
+            {
+                "role": "assistant", 
+                "content": json.dumps(deterministic_data),
+                "reasoning_details": reasoning_l2
+            },
+            {"role": "user", "content": final_prompt}
+        ]
+        
+        final_res = await call_openrouter(messages_layer3)
+        analysis_data = json.loads(final_res['choices'][0]['message'].get('content', '{}'))
+        
+        print(f"[OK] [LLM Service] OpenRouter ANALYSIS COMPLETE.")
+        # Debug log reasoning presence
+        if reasoning_l2:
+            print("[INFO] [LLM Service] Layer 2 Reasoning preserved in Layer 3.")
+            
         return analysis_data
     except Exception as e:
         print(f"[!] [LLM Service] ANALYSIS ERROR: {str(e)}")
@@ -312,31 +392,39 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                 "insurance": {{
                     "matched_policy_items": ["string: benefit name"],
                     "coverage_details": {{ "covered": ["string"], "conditional": ["string"], "excluded": ["string"] }},
-                    "waiting_periods": ["string: period description"]
+                    "waiting_periods": ["string: period description"],
+                    "contextual_guardrails": [
+                        {{
+                            "category": "Maternity|Oncology|Cardiology|Other",
+                            "limit_details": "string: sub-limits, caps, co-pays",
+                            "waiting_period": "string",
+                            "red_lining_risk": "High|Moderate|Low",
+                            "source_citation": "string: precise policy section"
+                        }}
+                    ]
                 }}
             }}
             STRICT RULES: 
-            1. NO conversational text. 
-            2. NO markdown formatting outside the JSON block.
-            3. All numeric scores must be INTEGERS.
-            4. Do NOT hallucinate data not present in texts.
+            1. Contextual Guardrails: ONLY populate if the Health Report indicates a relevant condition (e.g. identify 'Maternity' details ONLY if pregnancy is mentioned).
+            2. NO conversational text. 
+            3. NO markdown formatting outside the JSON block.
+            4. All numeric scores must be INTEGERS.
+            5. Do NOT hallucinate data not present in texts.
             """
             import asyncio
-            def call_mistral():
-                return client.chat.complete(
-                    model="mistral-large-latest",
-                    messages=[{"role": "user", "content": extraction_prompt}],
-                    response_format={"type": "json_object"}
-                )
+            # Layer 2: Extraction using OpenRouter with Reasoning
+            messages_l2 = [{"role": "user", "content": extraction_prompt}]
+            extract_res = await call_openrouter(messages_l2)
             
-            extract_res = await asyncio.to_thread(call_mistral)
-            deterministic_data = json.loads(extract_res.choices[0].message.content)
+            message_l2 = extract_res['choices'][0]['message']
+            deterministic_data = json.loads(message_l2.get('content', '{}'))
+            reasoning_l2 = message_l2.get('reasoning_details')
             
             # Track Tokens Layer 2
-            usage = extract_res.usage
-            total_tokens["prompt"] += usage.prompt_tokens
-            total_tokens["completion"] += usage.completion_tokens
-            total_tokens["total"] += usage.total_tokens
+            usage = extract_res.get('usage', {})
+            total_tokens["prompt"] += usage.get('prompt_tokens', 0)
+            total_tokens["completion"] += usage.get('completion_tokens', 0)
+            total_tokens["total"] += usage.get('total_tokens', 0)
             yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
 
             yield f"event: step\ndata: {json.dumps({'message': 'Formulating explanation parameters (Layer 3)', 'progress': 60})}\n\n"
@@ -389,13 +477,22 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                     "conditional": ["Condition X", "Condition Y"], 
                     "not_covered": ["Exclusion Z"], 
                     "future_cost_awareness": "Detailed impact on future premiums/costs", 
-                    "potential_out_of_pocket_increase": "Percentage string" 
+                    "potential_out_of_pocket_increase": "Percentage string",
+                    "contextual_guardrails": [{{
+                        "category": "Type",
+                        "limit_details": "Full explanation of sub-limits/caps",
+                        "waiting_period": "X months/years",
+                        "red_lining_risk": "High|Moderate|Low",
+                        "source_citation": "Policy Ref"
+                    }}]
                 }},
                 "future_coverage_mapping": [{{ 
                     "pattern": "Health Trend", 
                     "future_condition": "Likely Diagnosis", 
                     "coverage_status": "Covered|Excluded|Partial", 
                     "source_proof": "Policy Section X / Evidence text",
+                    "red_line_risk": "High|Moderate|Low",
+                    "intent_clarity_explanation": "How precisely the policy covers this intent",
                     "coverage_gap_risk": "High|Medium|Low", 
                     "severity_trend": "Increasing|Stable|Decreasing" 
                 }}],
@@ -403,22 +500,27 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             }}
             """
             
-            def call_mistral_final():
-                return client.chat.complete(
-                    model="mistral-large-latest",
-                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": final_prompt}],
-                    response_format={"type": "json_object"}
-                )
+            # Layer 3: Explanation using OpenRouter with Reasoning Pass-back
+            messages_l3 = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": extraction_prompt},
+                {
+                    "role": "assistant", 
+                    "content": json.dumps(deterministic_data),
+                    "reasoning_details": reasoning_l2
+                },
+                {"role": "user", "content": final_prompt}
+            ]
             
-            final_res = await asyncio.to_thread(call_mistral_final)
-            analysis_data = json.loads(final_res.choices[0].message.content)
+            final_res = await call_openrouter(messages_l3)
+            analysis_data = json.loads(final_res['choices'][0]['message'].get('content', '{}'))
             analysis_data["status"] = "success"
 
             # Track Tokens Layer 3
-            usage_final = final_res.usage
-            total_tokens["prompt"] += usage_final.prompt_tokens
-            total_tokens["completion"] += usage_final.completion_tokens
-            total_tokens["total"] += usage_final.total_tokens
+            usage_final = final_res.get('usage', {})
+            total_tokens["prompt"] += usage_final.get('prompt_tokens', 0)
+            total_tokens["completion"] += usage_final.get('completion_tokens', 0)
+            total_tokens["total"] += usage_final.get('total_tokens', 0)
             yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
             
             yield f"event: result\ndata: {json.dumps(analysis_data)}\n\n"
