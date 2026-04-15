@@ -43,11 +43,20 @@ def get_mistral_client() -> Mistral:
         raise ValueError("MISTRAL_API_KEY is not set")
     return Mistral(api_key=api_key)
 
-async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
+# Decoy Alias Map to hide LLM names from UI
+AGENT_ALIAS_MAP = {
+    "google/gemma-4-31b-it:free": "Primary Neural Specialist",
+    "google/gemma-4-26b-a4b-it:free": "Cognitive Logic Node",
+    "meta-llama/llama-3.1-8b-instruct:free": "Factual Cross-Reference Specialist",
+    "google/gemma-3-27b-it:free": "Secondary Contextual Analyst",
+    "default": "Backup Specialist Node"
+}
+
+async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False, on_retry: Optional[callable] = None):
     api_key = os.environ.get("OPENROUTER_API_KEY")
+    # We no longer strictly rely on .env for the primary model to ensure resilience
     primary_model = os.environ.get("ANALYSIS_MODEL", "google/gemma-4-31b-it:free")
     
-    # Fallback chain for reliability on free tier
     MODELS_CHAIN = [
         primary_model,
         "google/gemma-4-31b-it:free",
@@ -55,8 +64,6 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
         "meta-llama/llama-3.1-8b-instruct:free",
         "google/gemma-3-27b-it:free"
     ]
-    
-    # Remove duplicates while preserving order
     MODELS_CHAIN = list(dict.fromkeys(MODELS_CHAIN))
 
     if not api_key:
@@ -68,8 +75,13 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
     }
     
     last_error = ""
-    for model in MODELS_CHAIN:
+    for idx, model in enumerate(MODELS_CHAIN):
         try:
+            # Notify UI of retry if not the first attempt
+            if idx > 0 and on_retry:
+                alias = AGENT_ALIAS_MAP.get(model, AGENT_ALIAS_MAP["default"])
+                await on_retry(alias)
+
             print(f"[*] [LLM Service] Attempting OpenRouter call with: {model}")
             payload = {
                 "model": model,
@@ -78,27 +90,25 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
                 "response_format": {"type": "json_object"}
             }
             
+            # Using 30s timeout for seamless fallback logic
             if stream:
-                return httpx.AsyncClient().stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+                return httpx.AsyncClient().stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
             
             async with httpx.AsyncClient() as client:
-                resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+                resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
                 
-                # Check for rate limits or endpoint missing
                 if resp.status_code in [429, 404, 503]:
-                    err_text = resp.json().get("error", {}).get("message", "Unknown error")
-                    print(f"[!] [LLM Service] Model {model} failed ({resp.status_code}): {err_text}")
-                    last_error = f"{model}: {err_text}"
+                    err_msg = resp.json().get("error", {}).get("message", "Provider busy")
+                    print(f"[!] [LLM Service] Model {model} failed ({resp.status_code}): {err_msg}")
+                    last_error = f"{model}: {err_msg}"
                     continue
                 
                 if resp.status_code != 200:
-                    # If json_object is the culprit, retry ONE time without it for this model
                     if resp.status_code == 400 and "response_format" in str(resp.text):
                         print(f"[*] [LLM Service] Retrying {model} without response_format...")
                         del payload["response_format"]
-                        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
-                        if resp.status_code == 200:
-                            return resp.json()
+                        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
+                        if resp.status_code == 200: return resp.json()
                     
                     last_error = f"{model} Error: {resp.text}"
                     continue
@@ -123,6 +133,11 @@ def clean_json_response(content: str) -> str:
     content = re.sub(r'```json\s*', '', content)
     content = re.sub(r'```', '', content)
     return content.strip()
+
+def get_token_estimate(text: str) -> int:
+    """Fallback token estimation (approx 4 chars per token)."""
+    if not text: return 0
+    return max(1, len(text) // 4)
 
 class AnalyzePayload(BaseModel):
     health_text: str
@@ -405,10 +420,6 @@ async def analyze_coverage(payload: AnalyzePayload):
         analysis_data = json.loads(content_l3)
         
         print(f"[OK] [LLM Service] OpenRouter ANALYSIS COMPLETE.")
-        # Debug log reasoning presence
-        if reasoning_l2:
-            print("[INFO] [LLM Service] Layer 2 Reasoning preserved in Layer 3.")
-            
         return analysis_data
     except Exception as e:
         print(f"[!] [LLM Service] ANALYSIS ERROR: {str(e)}")
@@ -466,20 +477,28 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             5. Do NOT hallucinate data not present in texts.
             """
             import asyncio
+            # Notify UI of Agent Selection
+            async def on_retry_l2(alias: str):
+                yield f"event: retry\ndata: {json.dumps({'agent_alias': alias})}\n\n"
+
             # Layer 2: Extraction using OpenRouter with Reasoning
             messages_l2 = [{"role": "user", "content": extraction_prompt}]
-            extract_res = await call_openrouter(messages_l2)
+            extract_res = await call_openrouter(messages_l2, on_retry=on_retry_l2)
             
             message_l2 = extract_res['choices'][0]['message']
             content_l2 = clean_json_response(message_l2.get('content', '{}'))
             deterministic_data = json.loads(content_l2)
             reasoning_l2 = message_l2.get('reasoning_details')
             
-            # Track Tokens Layer 2
+            # Track Tokens Layer 2 with Fallback Estimation
             usage = extract_res.get('usage', {})
-            total_tokens["prompt"] += usage.get('prompt_tokens', 0)
-            total_tokens["completion"] += usage.get('completion_tokens', 0)
-            total_tokens["total"] += usage.get('total_tokens', 0)
+            p_tokens = usage.get('prompt_tokens') or get_token_estimate(extraction_prompt)
+            c_tokens = usage.get('completion_tokens') or get_token_estimate(message_l2.get('content', ''))
+            
+            total_tokens["prompt"] += p_tokens
+            total_tokens["completion"] += c_tokens
+            total_tokens["total"] += (p_tokens + c_tokens)
+            
             yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
 
             yield f"event: step\ndata: {json.dumps({'message': 'Formulating explanation parameters (Layer 3)', 'progress': 60})}\n\n"
@@ -567,18 +586,24 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                 {"role": "user", "content": final_prompt}
             ]
             
-            final_res = await call_openrouter(messages_l3)
+            async def on_retry_l3(alias: str):
+                yield f"event: retry\ndata: {json.dumps({'agent_alias': alias})}\n\n"
+
+            final_res = await call_openrouter(messages_l3, on_retry=on_retry_l3)
             content_l3 = clean_json_response(final_res['choices'][0]['message'].get('content', '{}'))
             analysis_data = json.loads(content_l3)
             analysis_data["status"] = "success"
 
-            # Track Tokens Layer 3
+            # Track Tokens Layer 3 with Fallback Estimation
             usage_final = final_res.get('usage', {})
-            total_tokens["prompt"] += usage_final.get('prompt_tokens', 0)
-            total_tokens["completion"] += usage_final.get('completion_tokens', 0)
-            total_tokens["total"] += usage_final.get('total_tokens', 0)
-            yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
+            p_tokens_l3 = usage_final.get('prompt_tokens') or get_token_estimate(str(messages_l3))
+            c_tokens_l3 = usage_final.get('completion_tokens') or get_token_estimate(content_l3)
             
+            total_tokens["prompt"] += p_tokens_l3
+            total_tokens["completion"] += c_tokens_l3
+            total_tokens["total"] += (p_tokens_l3 + c_tokens_l3)
+            
+            yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
             yield f"event: result\ndata: {json.dumps(analysis_data)}\n\n"
             print("[OK] [LLM Service] ANALYSIS STREAM COMPLETE.")
             
