@@ -45,8 +45,20 @@ def get_mistral_client() -> Mistral:
 
 async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    model = os.environ.get("ANALYSIS_MODEL", "google/gemma-4-26b-a4b-it:free")
+    primary_model = os.environ.get("ANALYSIS_MODEL", "google/gemma-4-31b-it:free")
     
+    # Fallback chain for reliability on free tier
+    MODELS_CHAIN = [
+        primary_model,
+        "google/gemma-4-31b-it:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "google/gemma-3-27b-it:free"
+    ]
+    
+    # Remove duplicates while preserving order
+    MODELS_CHAIN = list(dict.fromkeys(MODELS_CHAIN))
+
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
@@ -55,22 +67,62 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False):
         "Content-Type": "application/json"
     }
     
-    payload = {
-        "model": model,
-        "messages": messages,
-        "reasoning": {"enabled": True},
-        "response_format": {"type": "json_object"}
-    }
-    
-    if stream:
-        return httpx.AsyncClient().stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
-    else:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
-            if resp.status_code != 200:
-                print(f"[!] OpenRouter Error: {resp.text}")
-                raise HTTPException(status_code=resp.status_code, detail=f"OpenRouter Error: {resp.text}")
-            return resp.json()
+    last_error = ""
+    for model in MODELS_CHAIN:
+        try:
+            print(f"[*] [LLM Service] Attempting OpenRouter call with: {model}")
+            payload = {
+                "model": model,
+                "messages": messages,
+                "reasoning": {"enabled": True},
+                "response_format": {"type": "json_object"}
+            }
+            
+            if stream:
+                return httpx.AsyncClient().stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+            
+            async with httpx.AsyncClient() as client:
+                resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+                
+                # Check for rate limits or endpoint missing
+                if resp.status_code in [429, 404, 503]:
+                    err_text = resp.json().get("error", {}).get("message", "Unknown error")
+                    print(f"[!] [LLM Service] Model {model} failed ({resp.status_code}): {err_text}")
+                    last_error = f"{model}: {err_text}"
+                    continue
+                
+                if resp.status_code != 200:
+                    # If json_object is the culprit, retry ONE time without it for this model
+                    if resp.status_code == 400 and "response_format" in str(resp.text):
+                        print(f"[*] [LLM Service] Retrying {model} without response_format...")
+                        del payload["response_format"]
+                        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=120.0)
+                        if resp.status_code == 200:
+                            return resp.json()
+                    
+                    last_error = f"{model} Error: {resp.text}"
+                    continue
+                
+                print(f"[OK] [LLM Service] Success with model: {model}")
+                return resp.json()
+
+        except Exception as e:
+            print(f"[!] [LLM Service] Exception with {model}: {str(e)}")
+            last_error = str(e)
+            continue
+            
+    # If all fail
+    raise HTTPException(status_code=503, detail=f"All OpenRouter models in fallback chain failed. Last Error: {last_error}")
+
+def clean_json_response(content: str) -> str:
+    """Strips reasoning/thought tags from content to extract pure JSON."""
+    if not content: return "{}"
+    # Remove <thought>...</thought> or <think>...</think>
+    content = re.sub(r'<(thought|think)>.*?</\1>', '', content, flags=re.DOTALL)
+    # Remove any markdown code blocks
+    content = re.sub(r'```json\s*', '', content)
+    content = re.sub(r'```', '', content)
+    return content.strip()
 
 class AnalyzePayload(BaseModel):
     health_text: str
@@ -262,7 +314,8 @@ async def analyze_coverage(payload: AnalyzePayload):
         extract_res = await call_openrouter(messages_layer2)
         
         message_l2 = extract_res['choices'][0]['message']
-        deterministic_data = json.loads(message_l2.get('content', '{}'))
+        content_l2 = clean_json_response(message_l2.get('content', '{}'))
+        deterministic_data = json.loads(content_l2)
         reasoning_l2 = message_l2.get('reasoning_details')
 
         system_prompt = """
@@ -348,7 +401,8 @@ async def analyze_coverage(payload: AnalyzePayload):
         ]
         
         final_res = await call_openrouter(messages_layer3)
-        analysis_data = json.loads(final_res['choices'][0]['message'].get('content', '{}'))
+        content_l3 = clean_json_response(final_res['choices'][0]['message'].get('content', '{}'))
+        analysis_data = json.loads(content_l3)
         
         print(f"[OK] [LLM Service] OpenRouter ANALYSIS COMPLETE.")
         # Debug log reasoning presence
@@ -417,7 +471,8 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             extract_res = await call_openrouter(messages_l2)
             
             message_l2 = extract_res['choices'][0]['message']
-            deterministic_data = json.loads(message_l2.get('content', '{}'))
+            content_l2 = clean_json_response(message_l2.get('content', '{}'))
+            deterministic_data = json.loads(content_l2)
             reasoning_l2 = message_l2.get('reasoning_details')
             
             # Track Tokens Layer 2
@@ -513,7 +568,8 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             ]
             
             final_res = await call_openrouter(messages_l3)
-            analysis_data = json.loads(final_res['choices'][0]['message'].get('content', '{}'))
+            content_l3 = clean_json_response(final_res['choices'][0]['message'].get('content', '{}'))
+            analysis_data = json.loads(content_l3)
             analysis_data["status"] = "success"
 
             # Track Tokens Layer 3
