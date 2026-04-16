@@ -45,26 +45,24 @@ def get_mistral_client() -> Mistral:
 
 # Decoy Alias Map to hide LLM names from UI
 AGENT_ALIAS_MAP = {
-    "google/gemma-4-31b-it:free": "Primary Neural Specialist",
-    "google/gemma-4-26b-a4b-it:free": "Cognitive Logic Node",
-    "meta-llama/llama-3.1-70b-instruct:free": "Advanced Reasoning Architect",
-    "meta-llama/llama-3.1-8b-instruct:free": "Factual Cross-Reference Specialist",
-    "google/gemma-3-27b-it:free": "Secondary Contextual Analyst",
-    "mistralai/mistral-7b-instruct:free": "Drafting Specialist Node",
-    "qwen/qwen-2-72b-instruct:free": "Complex Pattern Interpreter",
-    "mistral-small-latest": "Mistral High-Speed Logic Node",
-    "default": "Backup Specialist Node"
+    "mistral-small-latest": "High-Speed Logic Node",
+    "x-ai/grok-4.20-beta": "Primary Cognition Architect",
+    "qwen/qwen3.5-397b-a17b": "Deep Reasoning Master",
+    "qwen/qwen3.5-35b-a3b": "Balanced Logic Engine",
+    "nvidia/nemotron-3-super-120b:free": "Neural Efficiency Node",
+    "openrouter/free": "Resilient Backup Node",
+    "google/gemma-4-31b-it:free": "Secondary Contextual Analyst",
+    "default": "Specialist Backup Node"
 }
 
-# Global Fallback Chain
+# Global Fallback Chain (OpenRouter Only)
 FALLBACK_MODELS = [
+    "x-ai/grok-4.20-beta",
+    "qwen/qwen3.5-397b-a17b",
+    "qwen/qwen3.5-35b-a3b",
+    "nvidia/nemotron-3-super-120b:free",
     "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "meta-llama/llama-3.1-70b-instruct:free",
-    "google/gemma-3-27b-it:free",
-    "meta-llama/llama-3.1-8b-instruct:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2-72b-instruct:free"
+    "openrouter/free"
 ]
 
 async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False, on_retry: Optional[callable] = None):
@@ -80,58 +78,96 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False, 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://lumehealth.ai", # Required by OpenRouter for free models
-        "X-Title": "LumeHealth Intelligence"
+        "HTTP-Referer": "https://lume.up.railway.app/", # Required by OpenRouter for free models
+        "X-Title": "LumeHealth Debug"
     }
     
     last_error = ""
     for idx, model in enumerate(MODELS_CHAIN):
         try:
-            # Notify UI of retry if not the first attempt
             if idx > 0 and on_retry:
                 alias = AGENT_ALIAS_MAP.get(model, AGENT_ALIAS_MAP["default"])
                 await on_retry(alias)
 
-            print(f"[*] [LLM Service] Attempting OpenRouter call with: {model}")
+            print(f"[*] [LLM Service] Attempting OpenRouter call with: {model} (Streaming Mode)")
             payload = {
                 "model": model,
                 "messages": messages,
+                "stream": True, # ALWAYS use stream to avoid timeouts and for better reliability
                 "reasoning": {"enabled": True},
                 "response_format": {"type": "json_object"}
             }
             
-            # Using 30s timeout for seamless fallback logic
-            if stream:
-                return httpx.AsyncClient().stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
-            
-            async with httpx.AsyncClient() as client:
-                resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
-                
-                if resp.status_code in [429, 404, 503]:
-                    err_msg = resp.json().get("error", {}).get("message", "Provider busy")
-                    print(f"[!] [LLM Service] Model {model} failed ({resp.status_code}): {err_msg}")
-                    last_error = f"{model}: {err_msg}"
-                    continue
-                
-                if resp.status_code != 200:
-                    if resp.status_code == 400 and "response_format" in str(resp.text):
-                        print(f"[*] [LLM Service] Retrying {model} without response_format...")
-                        del payload["response_format"]
-                        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
-                        if resp.status_code == 200: return resp.json()
+            full_content = ""
+            usage_data = {}
+            reasoning_data = ""
+
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload) as response:
+                    if response.status_code in [429, 404, 503]:
+                        resp_json = await response.json()
+                        err_msg = resp_json.get("error", {}).get("message", "Intelligence Node busy")
+                        print(f"[!] [LLM Service] Model {model} failed ({response.status_code}): {err_msg}")
+                        last_error = f"{model}: {err_msg}"
+                        continue
                     
-                    last_error = f"{model} Error: {resp.text}"
-                    continue
-                
-                print(f"[OK] [LLM Service] Success with model: {model}")
-                return resp.json()
+                    if response.status_code != 200:
+                        err_text = await response.read()
+                        last_error = f"{model} Error: {err_text.decode()}"
+                        continue
+
+                    async for line in response.aiter_lines():
+                        if not line or line.startswith(":"): # Ignore heartbeats/comments
+                            continue
+                        
+                        if line.startswith("data: "):
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            
+                            chunk = json.loads(data_str)
+                            delta = chunk['choices'][0].get('delta', {})
+                            
+                            # Extract content
+                            if 'content' in delta and delta['content']:
+                                full_content += delta['content']
+                            
+                            # Extract reasoning
+                            if 'reasoning' in delta and delta['reasoning']:
+                                reasoning_data += delta['reasoning']
+                            elif 'reasoning_details' in delta and delta['reasoning_details']:
+                                # Some providers put it here
+                                if isinstance(delta['reasoning_details'], str):
+                                    reasoning_data += delta['reasoning_details']
+                                elif isinstance(delta['reasoning_details'], list):
+                                    for rd in delta['reasoning_details']:
+                                        if rd.get('type') == 'reasoning.text':
+                                            reasoning_data += rd.get('text', '')
+
+                            # Extract usage (usually in final chunk)
+                            if 'usage' in chunk:
+                                usage_data = chunk['usage']
+
+            print(f"[OK] [LLM Service] Success with model: {model} (Reconstructed {len(full_content)} chars)")
+            
+            # Return in standard OpenRouter format but include our alias
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": full_content,
+                        "reasoning_details": reasoning_data
+                    }
+                }],
+                "usage": usage_data,
+                "agent_alias": AGENT_ALIAS_MAP.get(model, AGENT_ALIAS_MAP["default"])
+            }
 
         except Exception as e:
-            print(f"[!] [LLM Service] Exception with {model}: {str(e)}")
+            print(f"[!] [LLM Service] SSE Exception with {model}: {str(e)}")
             last_error = str(e)
             continue
             
-    # If all fail
     raise HTTPException(status_code=503, detail=f"All OpenRouter models failed. Logs: {last_error}")
 
 async def call_mistral_direct(messages: List[Dict[str, Any]]):
@@ -139,10 +175,16 @@ async def call_mistral_direct(messages: List[Dict[str, Any]]):
     try:
         print(f"[*] [LLM Service] Critical Fallback: Attempting Mistral Direct API...")
         client = get_mistral_client()
-        # Using mistral-small-latest for optimal speed/reasoning balance
+        
+        # Strip reasoning_details if present in messages as Mistral doesn't support them
+        clean_messages = []
+        for msg in messages:
+            m = {k: v for k, v in msg.items() if k != "reasoning_details" and k != "reasoning"}
+            clean_messages.append(m)
+            
         response = client.chat.complete(
             model="mistral-small-latest",
-            messages=messages,
+            messages=clean_messages,
             response_format={"type": "json_object"}
         )
         
@@ -182,6 +224,8 @@ def get_token_estimate(text: str) -> int:
 class AnalyzePayload(BaseModel):
     health_text: str
     policy_text: str
+    health_filename: Optional[str] = None
+    policy_filename: Optional[str] = None
 
 # --- Guardrail Schemas ---
 
@@ -231,6 +275,7 @@ class ComprehensiveAnalysisResponse(BaseModel):
     insurance: InsuranceInfo
     future_coverage_mapping: List[FutureMapping]
     disclaimer: str
+    validation_warnings: List[str] = []
     status: Optional[str] = "success"
 
 # --- Utility Functions ---
@@ -355,11 +400,16 @@ async def analyze_coverage(payload: AnalyzePayload):
                         "source_citation": "string: precise policy section"
                     }}
                 ]
+            }},
+            "identity": {{
+                "patient_name": "string",
+                "policy_holder_name": "string"
             }}
         }}
         STRICT RULES: 
         1. Contextual Guardrails: ONLY populate if the Health Report indicates a relevant condition (e.g. identify 'Maternity' details ONLY if pregnancy is mentioned).
-        2. NO conversational text. 
+        2. Identity Check: Carefully extract the Patient Name from the Health Text and the Policy Holder/Member Name from the Policy Text.
+        3. NO conversational text. 
         3. NO markdown formatting outside the JSON block.
         4. All numeric scores must be INTEGERS.
         5. Do NOT hallucinate data not present in texts.
@@ -460,6 +510,21 @@ async def analyze_coverage(payload: AnalyzePayload):
         analysis_data = json.loads(content_l3)
         
         print(f"[OK] [LLM Service] OpenRouter ANALYSIS COMPLETE.")
+        
+        # Identity Cross-Check Logic
+        validation_warnings = []
+        identity = deterministic_data.get("identity", {})
+        p_name = identity.get("patient_name", "").strip().lower()
+        h_name = identity.get("policy_holder_name", "").strip().lower()
+        
+        if p_name and h_name:
+            # Simple fuzzy check: if one isn't contained in the other and they are reasonably long
+            if p_name not in h_name and h_name not in p_name and len(p_name) > 3 and len(h_name) > 3:
+                msg = f"Identity Mismatch Detected: Health Report belongs to '{identity.get('patient_name')}' but Policy belongs to '{identity.get('policy_holder_name')}'."
+                print(f"[WARNING] {msg}")
+                validation_warnings.append(msg)
+        
+        analysis_data["validation_warnings"] = validation_warnings
         return analysis_data
     except Exception as e:
         print(f"[!] [LLM Service] ANALYSIS ERROR: {str(e)}")
@@ -507,11 +572,16 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                             "source_citation": "string: precise policy section"
                         }}
                     ]
+                }},
+                "identity": {{
+                    "patient_name": "string",
+                    "policy_holder_name": "string"
                 }}
             }}
             STRICT RULES: 
             1. Contextual Guardrails: ONLY populate if the Health Report indicates a relevant condition (e.g. identify 'Maternity' details ONLY if pregnancy is mentioned).
-            2. NO conversational text. 
+            2. Identity Check: Carefully extract the Patient Name from the Health Text and the Policy Holder/Member Name from the Policy Text.
+            3. NO conversational text. 
             3. NO markdown formatting outside the JSON block.
             4. All numeric scores must be INTEGERS.
             5. Do NOT hallucinate data not present in texts.
@@ -526,12 +596,12 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             
             extract_res = None
             try:
-                # One call handles the entire Fallback Chain
-                extract_res = await call_openrouter(messages_l2, stream=False)
-            except Exception as e:
-                print(f"[!] OpenRouter Chain Exhausted (L2). engaging Mistral Fallback...")
-                yield f"event: retry\ndata: {json.dumps({'agent_alias': 'Mistral High-Speed Logic Node'})}\n\n"
+                # Primary Entry: Mistral Direct (High-Speed Logic Node)
                 extract_res = await call_mistral_direct(messages_l2)
+            except Exception as e:
+                print(f"[!] Mistral Direct failed (L2). engaging Advanced OpenRouter Chain...")
+                yield f"event: retry\ndata: {json.dumps({'agent_alias': 'Advanced Reasoning Chain'})}\n\n"
+                extract_res = await call_openrouter(messages_l2, stream=False)
             
             if not extract_res:
                 raise HTTPException(status_code=503, detail="Analytical Layer 2 failed entirely.")
@@ -539,7 +609,12 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             message_l2 = extract_res['choices'][0]['message']
             content_l2 = clean_json_response(message_l2.get('content', '{}'))
             deterministic_data = json.loads(content_l2)
-            reasoning_l2 = message_l2.get('reasoning_details')
+            
+            # Extract reasoning or reasoning_details per spec
+            reasoning_l2 = message_l2.get('reasoning') or message_l2.get('reasoning_details')
+            if not reasoning_l2:
+                # Some models put it at the choice level
+                reasoning_l2 = extract_res['choices'][0].get('reasoning')
             
             # Track Tokens Layer 2 with Fallback Estimation
             usage = extract_res.get('usage', {})
@@ -642,18 +717,32 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
 
             final_res = None
             try:
-                # One call handles the entire Fallback Chain
-                final_res = await call_openrouter(messages_l3, stream=False)
-            except Exception as e:
-                print(f"[!] OpenRouter Chain Exhausted (L3). engaging Mistral Fallback...")
-                yield f"event: retry\ndata: {json.dumps({'agent_alias': 'Mistral High-Speed Logic Node'})}\n\n"
+                # Primary Entry: Mistral Direct (High-Speed Logic Node)
                 final_res = await call_mistral_direct(messages_l3)
+            except Exception as e:
+                print(f"[!] Mistral Direct failed (L3). engaging Advanced OpenRouter Chain...")
+                yield f"event: retry\ndata: {json.dumps({'agent_alias': 'Advanced Reasoning Chain'})}\n\n"
+                final_res = await call_openrouter(messages_l3, stream=False)
 
             if not final_res:
                 raise HTTPException(status_code=503, detail="Analytical Layer 3 failed entirely.")
             content_l3 = clean_json_response(final_res['choices'][0]['message'].get('content', '{}'))
             analysis_data = json.loads(content_l3)
             analysis_data["status"] = "success"
+
+            # Identity Cross-Check Logic
+            validation_warnings = []
+            identity = deterministic_data.get("identity", {})
+            p_name = identity.get("patient_name", "").strip().lower()
+            h_name = identity.get("policy_holder_name", "").strip().lower()
+            
+            if p_name and h_name:
+                if p_name not in h_name and h_name not in p_name and len(p_name) > 3 and len(h_name) > 3:
+                    msg = f"Identity Mismatch Detected: Health Report belongs to '{identity.get('patient_name')}' but Policy belongs to '{identity.get('policy_holder_name')}'."
+                    print(f"[WARNING] {msg}")
+                    validation_warnings.append(msg)
+            
+            analysis_data["validation_warnings"] = validation_warnings
 
             # Track Tokens Layer 3 with Fallback Estimation
             usage_final = final_res.get('usage', {})
@@ -665,6 +754,7 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             total_tokens["total"] += (p_tokens_l3 + c_tokens_l3)
             
             yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
+            analysis_data["agent_alias"] = final_res.get("agent_alias", "Intelligence Node")
             yield f"event: result\ndata: {json.dumps(analysis_data)}\n\n"
             print("[OK] [LLM Service] ANALYSIS STREAM COMPLETE.")
             
