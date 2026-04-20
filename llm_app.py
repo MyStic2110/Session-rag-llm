@@ -29,38 +29,58 @@ logging.basicConfig(
 )
 audit_logger = logging.getLogger("LumeHealthAudit")
 
-# --- Enterprise Shield: MongoDB Connection ---
-mongo_uri = os.environ.get("MONGO_URI")
-db_client = None
+# --- Enterprise Shield: MongoDB Connectivity & Lifespan ---
 db = None
-if mongo_uri:
-    try:
-        db_client = AsyncIOMotorClient(mongo_uri)
-        db = db_client["lumehealth"]
-        print(f"[*] [LLM Service] Connected to MongoDB: {db.name}")
-    except Exception as e:
-        print(f"[!] [LLM Service] MongoDB Connection Failed: {str(e)}")
+db_client = None
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db, db_client
+    mongo_uri = os.environ.get("MONGO_URI")
+    if mongo_uri:
+        try:
+            print(f"[*] [LLM Service] Attempting MongoDB initialization...")
+            db_client = AsyncIOMotorClient(mongo_uri)
+            # Connectivity check (forced)
+            await db_client.admin.command('ping')
+            db = db_client["lumehealth"]
+            print(f"[OK] [LLM Service] MongoDB initialized successfully: {db.name}")
+        except Exception as e:
+            print(f"[!] [LLM Service] MongoDB Startup Connection Failed: {str(e)}")
+            db = None
+            db_client = None
+    
+    yield
+    
+    if db_client:
+        print("[*] [LLM Service] Closing MongoDB connection...")
+        db_client.close()
 
 async def log_to_db(audit_data: Dict[str, Any]):
     """Logs audit data to MongoDB with a local file fallback."""
+    global db
     try:
         if db is not None:
+            # Automatic collection handling
             await db.audit_logs.insert_one({
                 **audit_data,
                 "timestamp": datetime.utcnow()
             })
+            print(f"[OK] [LLM Service] Audit entry saved to DB (AuditID: {audit_data.get('audit_id')})")
             return True
+        else:
+            print(f"[!] [LLM Service] MongoDB not initialized. Falling back to local log.")
     except Exception as e:
-        print(f"[!] [LLM Service] MongoDB Logging Failed: {str(e)}")
+        print(f"[!] [LLM Service] MongoDB Logging Failed (AuditID: {audit_data.get('audit_id')}): {str(e)}")
     
-    # Fallback to local log
+    # Fallback to local log for resilience
     audit_logger.info(f"DB_FALLBACK - {json.dumps(audit_data)}")
     return False
 
 # --- Enterprise Shield: Result Cache ---
 ANALYSIS_CACHE: Dict[str, Any] = {}
 
-app = FastAPI(title="LumeHealth - LLM Microservice")
+app = FastAPI(title="LumeHealth - LLM Microservice", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,9 +92,20 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
+    db_status = "disconnected"
+    global db
+    if db is not None:
+        try:
+            await db.command("ping")
+            db_status = "connected"
+        except Exception as e:
+            print(f"[!] [LLM Service] Health Check DB Ping Failed: {str(e)}")
+            db_status = "error"
+
     return {
         "status": "online",
         "service": "LumeHealth LLM Microservice",
+        "mongodb": db_status,
         "model": os.environ.get("ANALYSIS_MODEL", "google/gemma-4-26b-a4b-it:free"),
         "ocr_engine": "Mistral OCR 2512"
     }
@@ -612,6 +643,7 @@ async def analyze_coverage(payload: AnalyzePayload):
         report["performance"]["latency_ms"] = int((time.time() - start_time) * 1000)
         report["performance"]["token_count"] = analysis_data.get("tokens", {}).get("total", 0)
         report["nodes"]["primary_agent"] = analysis_data.get("agent_alias", "Intelligence Node")
+        report["result"] = analysis_data # Store actual results in the audit log
         
         ANALYSIS_CACHE[cache_key] = analysis_data
         await log_to_db(report)
@@ -885,6 +917,7 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             report["performance"]["latency_ms"] = int((time.time() - start_time) * 1000)
             report["performance"]["token_count"] = total_tokens.get("total", 0)
             report["nodes"]["primary_agent"] = analysis_data.get("agent_alias", "Intelligence Node")
+            report["result"] = analysis_data # Store actual results in the audit log
             
             ANALYSIS_CACHE[cache_key] = analysis_data
             await log_to_db(report)
