@@ -6,8 +6,8 @@ from typing import Dict, Any, cast, List, Optional
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from mistralai.client import Mistral
@@ -36,6 +36,13 @@ db_client = None
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     global db, db_client
+
+    # --- Startup: Validate Required Environment Variables ---
+    required_vars = ["MISTRAL_API_KEY", "OPENROUTER_API_KEY"]
+    for var in required_vars:
+        if not os.environ.get(var):
+            print(f"[!!!] [LLM Service] CRITICAL: Required environment variable '{var}' is NOT SET. Service may not function.")
+
     mongo_uri = os.environ.get("MONGO_URI")
     if mongo_uri:
         try:
@@ -61,7 +68,7 @@ async def lifespan(app: FastAPI):
             db = None
             db_client = None
     else:
-        print("[!] [LLM Service] MONGO_URI environment variable is MISSSING.")
+        print("[!] [LLM Service] MONGO_URI environment variable is MISSING. Audit logging will use local file fallback.")
     
     yield
     
@@ -96,6 +103,23 @@ async def log_to_db(audit_data: Dict[str, Any]):
 ANALYSIS_CACHE: Dict[str, Any] = {}
 
 app = FastAPI(title="LumeHealth - LLM Microservice", lifespan=lifespan)
+
+# --- Global Exception Handler: Always return clean JSON ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    err_str = str(exc)
+    print(f"[!!!] [LLM Service] Unhandled Exception on {request.url.path}: {err_str}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal error occurred in the Intelligence Engine. Please try again."},
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -319,6 +343,24 @@ class AnalyzePayload(BaseModel):
     health_filename: Optional[str] = None
     policy_filename: Optional[str] = None
 
+    @validator('health_text')
+    def health_text_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError('Health report text cannot be empty.')
+        if len(v) < 50:
+            raise ValueError('Health report text is too short to be a valid document.')
+        return v
+
+    @validator('policy_text')
+    def policy_text_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError('Insurance policy text cannot be empty.')
+        if len(v) < 50:
+            raise ValueError('Insurance policy text is too short to be a valid document.')
+        return v
+
 # --- Guardrail Schemas ---
 
 class AbnormalExplanation(BaseModel):
@@ -403,6 +445,10 @@ const_safety_disclaimer = (
 
 @app.post("/ocr")
 async def process_ocr(doc_type: str = Form(...), file: UploadFile = File(...)):
+    # Validate doc_type
+    if doc_type not in ("health", "policy"):
+        raise HTTPException(status_code=400, detail="Invalid document type. Must be 'health' or 'policy'.")
+
     print(f"[*] [LLM Service] Processing OCR for: {file.filename} of type {doc_type}")
     
     engine = os.environ.get("OCR_ENGINE", "mistral").lower()
@@ -412,8 +458,18 @@ async def process_ocr(doc_type: str = Form(...), file: UploadFile = File(...)):
     content_bytes = cast(bytes, raw_content)
     
     if len(content_bytes) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large. Maximum size is 5MB.")
+        raise HTTPException(status_code=413, detail="File too large. Maximum allowed size is 5MB.")
     
+    # --- PDF Magic Byte Validation (%PDF header) ---
+    if not content_bytes.startswith(b'%PDF'):
+        raise HTTPException(
+            status_code=415,
+            detail="Invalid file format. Please upload a valid PDF document from your medical provider or insurance company."
+        )
+
+    if len(content_bytes) < 100:
+        raise HTTPException(status_code=400, detail="The uploaded file appears to be empty or corrupted.")
+
     tmp_path = ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -421,9 +477,14 @@ async def process_ocr(doc_type: str = Form(...), file: UploadFile = File(...)):
             tmp_path = tmp.name
         return await run_mistral_ocr_process(tmp_path, file.filename)
             
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[!] [LLM Service] OCR ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"OCR failed: {str(e)}")
+        err_msg = str(e)
+        print(f"[!] [LLM Service] OCR ERROR: {err_msg}")
+        if "api" in err_msg.lower() or "mistral" in err_msg.lower():
+            raise HTTPException(status_code=503, detail="Document scanner is temporarily unavailable. Please try again in a moment.")
+        raise HTTPException(status_code=500, detail="Failed to process the document. Please ensure the PDF is not password-protected or corrupted.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
