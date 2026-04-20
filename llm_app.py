@@ -39,16 +39,29 @@ async def lifespan(app: FastAPI):
     mongo_uri = os.environ.get("MONGO_URI")
     if mongo_uri:
         try:
-            print(f"[*] [LLM Service] Attempting MongoDB initialization...")
-            db_client = AsyncIOMotorClient(mongo_uri)
+            masked_uri = mongo_uri.split("@")[-1] if "@" in mongo_uri else "HIDDEN"
+            print(f"[*] [LLM Service] Attempting MongoDB initialization (Host: {masked_uri})...")
+            
+            db_client = AsyncIOMotorClient(
+                mongo_uri, 
+                serverSelectionTimeoutMS=5000, 
+                connectTimeoutMS=10000,
+                tlsAllowInvalidCertificates=True
+            )
+            
             # Connectivity check (forced)
             await db_client.admin.command('ping')
             db = db_client["lumehealth"]
-            print(f"[OK] [LLM Service] MongoDB initialized successfully: {db.name}")
+            
+            # Write test for production verification
+            await db.startup_check.insert_one({"status": "active", "ts": datetime.utcnow()})
+            print(f"[OK] [LLM Service] MongoDB initialized and writable: {db.name}")
         except Exception as e:
             print(f"[!] [LLM Service] MongoDB Startup Connection Failed: {str(e)}")
             db = None
             db_client = None
+    else:
+        print("[!] [LLM Service] MONGO_URI environment variable is MISSSING.")
     
     yield
     
@@ -72,6 +85,8 @@ async def log_to_db(audit_data: Dict[str, Any]):
             print(f"[!] [LLM Service] MongoDB not initialized. Falling back to local log.")
     except Exception as e:
         print(f"[!] [LLM Service] MongoDB Logging Failed (AuditID: {audit_data.get('audit_id')}): {str(e)}")
+        if "timeout" in str(e).lower():
+            print("[TIP] This looks like a network timeout. Check MongoDB Atlas IP Whitelisting (0.0.0.0/0).")
     
     # Fallback to local log for resilience
     audit_logger.info(f"DB_FALLBACK - {json.dumps(audit_data)}")
