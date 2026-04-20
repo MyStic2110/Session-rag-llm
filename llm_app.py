@@ -11,12 +11,54 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from mistralai.client import Mistral
-from io import StringIO
-import sys
 import contextlib
 import httpx
-
+import hashlib
+import logging
+import uuid
+import time
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
 load_dotenv(override=True)
+
+# --- Enterprise Shield: Audit Logger ---
+logging.basicConfig(
+    filename="audit.log",
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+audit_logger = logging.getLogger("LumeHealthAudit")
+
+# --- Enterprise Shield: MongoDB Connection ---
+mongo_uri = os.environ.get("MONGO_URI")
+db_client = None
+db = None
+if mongo_uri:
+    try:
+        db_client = AsyncIOMotorClient(mongo_uri)
+        db = db_client["lumehealth"]
+        print(f"[*] [LLM Service] Connected to MongoDB: {db.name}")
+    except Exception as e:
+        print(f"[!] [LLM Service] MongoDB Connection Failed: {str(e)}")
+
+async def log_to_db(audit_data: Dict[str, Any]):
+    """Logs audit data to MongoDB with a local file fallback."""
+    try:
+        if db is not None:
+            await db.audit_logs.insert_one({
+                **audit_data,
+                "timestamp": datetime.utcnow()
+            })
+            return True
+    except Exception as e:
+        print(f"[!] [LLM Service] MongoDB Logging Failed: {str(e)}")
+    
+    # Fallback to local log
+    audit_logger.info(f"DB_FALLBACK - {json.dumps(audit_data)}")
+    return False
+
+# --- Enterprise Shield: Result Cache ---
+ANALYSIS_CACHE: Dict[str, Any] = {}
 
 app = FastAPI(title="LumeHealth - LLM Microservice")
 
@@ -93,7 +135,10 @@ async def call_openrouter(messages: List[Dict[str, Any]], stream: bool = False, 
             payload = {
                 "model": model,
                 "messages": messages,
-                "stream": True, # ALWAYS use stream to avoid timeouts and for better reliability
+                "stream": True, 
+                "temperature": 0.0, # Shield 1: Determinism
+                "top_p": 1.0,
+                "seed": 42, # Shield 1: Reproducibility
                 "reasoning": {"enabled": True},
                 "response_format": {"type": "json_object"}
             }
@@ -185,6 +230,7 @@ async def call_mistral_direct(messages: List[Dict[str, Any]]):
         response = client.chat.complete(
             model="mistral-small-latest",
             messages=clean_messages,
+            temperature=0, # Shield 1: Determinism
             response_format={"type": "json_object"}
         )
         
@@ -247,6 +293,7 @@ class ContextualGuardrail(BaseModel):
     waiting_period: str
     red_lining_risk: str
     source_citation: str
+    exact_quote: Optional[str] = "N/A"
 
 class InsuranceInfo(BaseModel):
     covered: List[str]
@@ -259,12 +306,14 @@ class InsuranceInfo(BaseModel):
 class FutureMapping(BaseModel):
     pattern: str
     future_condition: str
+    timeframe_years: str
     coverage_status: str
     coverage_gap_risk: str
     severity_trend: str
     source_proof: str
     red_line_risk: str
     intent_clarity_explanation: str
+    exact_quote: Optional[str] = "N/A"
 
 class ComprehensiveAnalysisResponse(BaseModel):
     summary: str
@@ -274,6 +323,8 @@ class ComprehensiveAnalysisResponse(BaseModel):
     recommendations: List[str]
     insurance: InsuranceInfo
     future_coverage_mapping: List[FutureMapping]
+    health_metrics: Dict[str, int] = Field(default_factory=dict)
+    confidence_score: float = 0.95
     disclaimer: str
     validation_warnings: List[str] = []
     status: Optional[str] = "success"
@@ -290,7 +341,11 @@ def scrub_pii(text: str) -> str:
     text = re.sub(r'(\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}', '[REDACTED_PHONE]', text)
     # 3. Specific Personal IDs (SSN, common medical ID formats)
     text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_ID]', text)
-    # 4. Patient Name Heuristics (matches phrases like "Patient Name: John Doe")
+    # 4. Dates of Birth (DOB) and other sensitive dates (e.g., 12/04/1985, 12-04-1985)
+    text = re.sub(r'\b(0?[1-9]|1[012])[- /.](0?[1-9]|[12][0-9]|3[01])[- /.](19|20)\d\d\b', '[REDACTED_DATE]', text)
+    # 5. Alphanumeric Medical Record Numbers (MRN) - e.g. MRN123456
+    text = re.sub(r'\b(MRN|ID|Patient|Member)\s*[:#-]?\s*[A-Z0-9]{5,}\b', r'\1: [REDACTED_CODE]', text, flags=re.IGNORECASE)
+    # 6. Patient Name Heuristics (matches phrases like "Patient Name: John Doe")
     text = re.sub(r'(?i)(patient\s*name|name|subject|client)\s*[:=-]\s*([A-Z][a-z]+(\s+[A-Z][a-z]+)+)', r'\1: [REDACTED_NAME]', text)
     return text
 
@@ -364,7 +419,28 @@ async def delete_file(file_id: str):
 
 @app.post("/analyze")
 async def analyze_coverage(payload: AnalyzePayload):
-    print(f"[*] [LLM Service] Starting Analysis...")
+    start_time = time.time()
+    audit_id = str(uuid.uuid4())
+    cache_key = hashlib.md5((payload.health_text + payload.policy_text).encode()).hexdigest()
+    
+    print(f"[*] [LLM Service] Starting Analysis (AuditID: {audit_id})...")
+    
+    # Base report
+    report = {
+        "audit_id": audit_id,
+        "doc_fingerprint": cache_key,
+        "files": {"health": payload.health_filename, "policy": payload.policy_filename},
+        "performance": {"cache_hit": False},
+        "nodes": {"ocr_engine": os.environ.get("OCR_ENGINE", "mistral")}
+    }
+
+    if cache_key in ANALYSIS_CACHE:
+        print(f"[OK] Cache Hit: {cache_key}")
+        report["performance"]["cache_hit"] = True
+        report["performance"]["latency_ms"] = int((time.time() - start_time) * 1000)
+        await log_to_db(report)
+        return ANALYSIS_CACHE[cache_key]
+
     client = get_mistral_client()
     
     try:
@@ -397,7 +473,8 @@ async def analyze_coverage(payload: AnalyzePayload):
                         "limit_details": "string: sub-limits, caps, co-pays",
                         "waiting_period": "string",
                         "red_lining_risk": "High|Moderate|Low",
-                        "source_citation": "string: precise policy section"
+                        "source_citation": "string: precise policy section",
+                        "exact_quote": "string: verbatim text snippet as direct evidence"
                     }}
                 ]
             }},
@@ -483,13 +560,17 @@ async def analyze_coverage(payload: AnalyzePayload):
             "future_coverage_mapping": [{{ 
                 "pattern": "Health Trend", 
                 "future_condition": "Likely Diagnosis", 
+                "timeframe_years": "Estimated timeframe (e.g., 2 Years, 10 Years)",
                 "coverage_status": "Covered|Excluded|Partial", 
                 "source_proof": "Policy Section X / Evidence text",
                 "red_line_risk": "High|Moderate|Low",
                 "intent_clarity_explanation": "How precisely the policy covers this intent",
                 "coverage_gap_risk": "High|Medium|Low", 
-                "severity_trend": "Increasing|Stable|Decreasing" 
+                "severity_trend": "Increasing|Stable|Decreasing",
+                "exact_quote": "string: verbatim source text supporting this mapping"
             }}],
+            "health_metrics": {{ "cardio": 0-100, "liver": 0-100, "respiratory": 0-100, "metabolic": 0-100 }},
+            "confidence_score": 0.0-1.0,
             "disclaimer": "Safety statement"
         }}
         """
@@ -525,14 +606,51 @@ async def analyze_coverage(payload: AnalyzePayload):
                 validation_warnings.append(msg)
         
         analysis_data["validation_warnings"] = validation_warnings
+        analysis_data["audit_id"] = audit_id
+        
+        # --- Finalize Master Report ---
+        report["performance"]["latency_ms"] = int((time.time() - start_time) * 1000)
+        report["performance"]["token_count"] = analysis_data.get("tokens", {}).get("total", 0)
+        report["nodes"]["primary_agent"] = analysis_data.get("agent_alias", "Intelligence Node")
+        
+        ANALYSIS_CACHE[cache_key] = analysis_data
+        await log_to_db(report)
+        
         return analysis_data
     except Exception as e:
+        audit_logger.error(f"AuditID: {audit_id} - ANALYSIS ERROR: {str(e)}")
         print(f"[!] [LLM Service] ANALYSIS ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/analyze/stream")
 async def analyze_coverage_stream(payload: AnalyzePayload):
-    print(f"[*] [LLM Service] Starting Analysis Stream...")
+    start_time = time.time()
+    audit_id = str(uuid.uuid4())
+    cache_key = hashlib.md5((payload.health_text + payload.policy_text).encode()).hexdigest()
+    
+    print(f"[*] [LLM Service] Starting Analysis Stream (AuditID: {audit_id})...")
+    
+    report = {
+        "audit_id": audit_id,
+        "doc_fingerprint": cache_key,
+        "files": {"health": payload.health_filename, "policy": payload.policy_filename},
+        "performance": {"cache_hit": False, "is_stream": True},
+        "nodes": {"ocr_engine": os.environ.get("OCR_ENGINE", "mistral")}
+    }
+
+    if cache_key in ANALYSIS_CACHE:
+        print(f"[OK] Cache Hit: {cache_key}")
+        report["performance"]["cache_hit"] = True
+        report["performance"]["latency_ms"] = int((time.time() - start_time) * 1000)
+        await log_to_db(report)
+        async def cached_generator():
+            yield f"event: result\ndata: {json.dumps(ANALYSIS_CACHE[cache_key])}\n\n"
+        return StreamingResponse(cached_generator(), media_type="text/event-stream")
+    
+    # --- Shield 2: Input Sanitization ---
+    payload.health_text = scrub_pii(payload.health_text)
+    payload.policy_text = scrub_pii(payload.policy_text)
+    
     client = get_mistral_client()
     
     async def event_generator():
@@ -569,7 +687,8 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                             "limit_details": "string: sub-limits, caps, co-pays",
                             "waiting_period": "string",
                             "red_lining_risk": "High|Moderate|Low",
-                            "source_citation": "string: precise policy section"
+                            "source_citation": "string: precise policy section",
+                            "exact_quote": "string: verbatim text snippet as direct evidence"
                         }}
                     ]
                 }},
@@ -689,13 +808,17 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
                 "future_coverage_mapping": [{{ 
                     "pattern": "Health Trend", 
                     "future_condition": "Likely Diagnosis", 
+                    "timeframe_years": "Estimated timeframe (e.g., 2 Years, 10 Years)",
                     "coverage_status": "Covered|Excluded|Partial", 
                     "source_proof": "Policy Section X / Evidence text",
                     "red_line_risk": "High|Moderate|Low",
                     "intent_clarity_explanation": "How precisely the policy covers this intent",
                     "coverage_gap_risk": "High|Medium|Low", 
-                    "severity_trend": "Increasing|Stable|Decreasing" 
+                    "severity_trend": "Increasing|Stable|Decreasing",
+                    "exact_quote": "string: verbatim source text supporting this mapping"
                 }}],
+                "health_metrics": {{ "cardio": 0-100, "liver": 0-100, "respiratory": 0-100, "metabolic": 0-100 }},
+                "confidence_score": 0.0-1.0,
                 "disclaimer": "Safety statement"
             }}
             """
@@ -754,7 +877,18 @@ async def analyze_coverage_stream(payload: AnalyzePayload):
             total_tokens["total"] += (p_tokens_l3 + c_tokens_l3)
             
             yield f"event: token\ndata: {json.dumps(total_tokens)}\n\n"
+            
             analysis_data["agent_alias"] = final_res.get("agent_alias", "Intelligence Node")
+            analysis_data["audit_id"] = audit_id
+            
+            # --- Finalize Master Report ---
+            report["performance"]["latency_ms"] = int((time.time() - start_time) * 1000)
+            report["performance"]["token_count"] = total_tokens.get("total", 0)
+            report["nodes"]["primary_agent"] = analysis_data.get("agent_alias", "Intelligence Node")
+            
+            ANALYSIS_CACHE[cache_key] = analysis_data
+            await log_to_db(report)
+            
             yield f"event: result\ndata: {json.dumps(analysis_data)}\n\n"
             print("[OK] [LLM Service] ANALYSIS STREAM COMPLETE.")
             

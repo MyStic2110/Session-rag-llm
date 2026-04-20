@@ -5,3 +5,5 @@ numpy
 python-multipart
 scikit-learn
 python-dotenv
+motor
+ 
